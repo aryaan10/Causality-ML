@@ -1,7 +1,7 @@
 """
 Causal Out-Strength Centrality Factor Model
 Inspired by Stavroglou et al. (2019) — "Causality Networks of Financial Assets"
-Data: Stooq CSV (direct requests, no pandas_datareader, works on Python 3.14+)
+Data: Yahoo Finance via yfinance Ticker.history() — parallel, works on Streamlit Cloud
 """
 
 import warnings
@@ -10,8 +10,6 @@ warnings.filterwarnings("ignore")
 import streamlit as st
 import numpy as np
 import pandas as pd
-import requests
-import io
 import networkx as nx
 import matplotlib
 matplotlib.use("Agg")
@@ -120,27 +118,31 @@ COLORS = {
     "neutral":   "#404040",
 }
 
+# Yahoo Finance tickers — all confirmed working via yfinance Ticker.history()
 ASSET_UNIVERSE = {
-    "^SPX":   {"name": "S&P 500",          "class": "equity"},
-    "^DAX":   {"name": "DAX Germany",       "class": "equity"},
-    "^CAC":   {"name": "CAC 40 France",     "class": "equity"},
-    "^NKX":   {"name": "Nikkei 225",        "class": "equity"},
+    # Equity indices
+    "^GSPC":  {"name": "S&P 500",          "class": "equity"},
+    "^GDAXI": {"name": "DAX Germany",       "class": "equity"},
+    "^FCHI":  {"name": "CAC 40 France",     "class": "equity"},
+    "^N225":  {"name": "Nikkei 225",        "class": "equity"},
     "^HSI":   {"name": "Hang Seng HK",      "class": "equity"},
     "^BSESN": {"name": "BSE Sensex India",  "class": "equity"},
     "^NSEI":  {"name": "Nifty 50 India",    "class": "equity"},
-    "^IBOV":  {"name": "Bovespa Brazil",    "class": "equity"},
+    "^BVSP":  {"name": "Bovespa Brazil",    "class": "equity"},
     "^AXJO":  {"name": "ASX 200 Australia", "class": "equity"},
-    "^SHC":   {"name": "Shanghai Comp",     "class": "equity"},
     "^FTSE":  {"name": "FTSE 100 UK",       "class": "equity"},
     "^KS11":  {"name": "KOSPI Korea",       "class": "equity"},
-    "^TNX":   {"name": "10Y US Treasury",   "class": "bond"},
-    "^TYX":   {"name": "30Y US Treasury",   "class": "bond"},
-    "^FVX":   {"name": "5Y US Treasury",    "class": "bond"},
-    "GC.F":   {"name": "Gold Futures",      "class": "commodity"},
-    "CL.F":   {"name": "Crude Oil WTI",     "class": "commodity"},
-    "SI.F":   {"name": "Silver Futures",    "class": "commodity"},
-    "NG.F":   {"name": "Natural Gas",       "class": "commodity"},
     "^TWII":  {"name": "Taiwan TAIEX",      "class": "equity"},
+    # Bond ETFs (more reliable than index tickers on Yahoo)
+    "SHY":    {"name": "2Y US Treasury",    "class": "bond"},
+    "IEF":    {"name": "10Y US Treasury",   "class": "bond"},
+    "TLT":    {"name": "20Y+ US Treasury",  "class": "bond"},
+    "LQD":    {"name": "Corp Bond IG",      "class": "bond"},
+    "HYG":    {"name": "High Yield Bond",   "class": "bond"},
+    # Commodity ETFs
+    "GLD":    {"name": "Gold",              "class": "commodity"},
+    "USO":    {"name": "Crude Oil WTI",     "class": "commodity"},
+    "SLV":    {"name": "Silver",            "class": "commodity"},
 }
 
 CRISIS_PERIODS = [
@@ -169,35 +171,26 @@ plt.rcParams.update({
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATA DOWNLOAD  (parallel, direct Stooq CSV — no pandas_datareader)
+# DATA DOWNLOAD  (yfinance Ticker.history — parallel, works on Streamlit Cloud)
 # ─────────────────────────────────────────────────────────────────────────────
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import yfinance as yf
 
-_STOOQ_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
-    )
-}
 
-def _fetch_one(ticker: str, start: str, end: str):
-    """Fetch one ticker weekly Close from Stooq CSV."""
-    d1 = start.replace("-", "")
-    d2 = end.replace("-", "")
-    t_enc = ticker.replace("^", "%5E").replace(".", "%2E")
-    url = f"https://stooq.com/q/d/l/?s={t_enc}&d1={d1}&d2={d2}&i=w"
+def _fetch_one_yf(ticker: str, start: str, end: str):
+    """
+    Fetch one ticker weekly Close via yfinance Ticker.history().
+    Uses per-ticker API (not yf.download) to avoid MultiIndex issues.
+    Returns (ticker, pd.Series | None, error_str | None).
+    """
     try:
-        resp = requests.get(url, headers=_STOOQ_HEADERS, timeout=20)
-        resp.raise_for_status()
-        text = resp.text.strip()
-        if not text or "No data" in text or len(text) < 30:
-            return ticker, None, "no data"
-        df = pd.read_csv(io.StringIO(text))
-        if "Date" not in df.columns or "Close" not in df.columns:
-            return ticker, None, "bad columns"
-        df["Date"] = pd.to_datetime(df["Date"])
-        series = df.set_index("Date")["Close"].sort_index()
+        t = yf.Ticker(ticker)
+        df = t.history(start=start, end=end, interval="1wk", auto_adjust=True, timeout=20)
+        if df is None or df.empty or "Close" not in df.columns:
+            return ticker, None, "empty response"
+        series = df["Close"].copy()
+        series.index = pd.to_datetime(series.index).tz_localize(None)
+        series = series.sort_index()
         if series.notna().sum() < 50:
             return ticker, None, "too few rows"
         return ticker, series, None
@@ -207,13 +200,14 @@ def _fetch_one(ticker: str, start: str, end: str):
 
 def download_data_parallel(tickers: tuple, start: str, end: str,
                             status_ph=None, progress_ph=None):
-    """Download all tickers in parallel (8 workers) with live progress."""
+    """Download all tickers in parallel (6 workers) with live progress."""
     n = len(tickers)
     frames = {}
     failed = []
     done = 0
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(_fetch_one, t, start, end): t for t in tickers}
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futures = {ex.submit(_fetch_one_yf, t, start, end): t for t in tickers}
         for fut in as_completed(futures):
             ticker, series, err = fut.result()
             done += 1
@@ -230,8 +224,8 @@ def download_data_parallel(tickers: tuple, start: str, end: str,
 
     if not frames:
         raise ValueError(
-            "No data fetched from Stooq. "
-            "Stooq may be temporarily rate-limiting — wait 30 s and try again."
+            "No data downloaded. Yahoo Finance may be temporarily unavailable — "
+            "please wait 30 s and try again."
         )
 
     prices = pd.DataFrame(frames).sort_index()
