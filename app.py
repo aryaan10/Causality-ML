@@ -169,51 +169,70 @@ plt.rcParams.update({
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATA DOWNLOAD
+# DATA DOWNLOAD  (parallel, direct Stooq CSV — no pandas_datareader)
 # ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False, ttl=3600)
-def download_data(tickers: tuple, start: str, end: str) -> pd.DataFrame:
-    def _stooq_csv(ticker: str, start: str, end: str):
-        """Fetch weekly Close prices from Stooq as a plain CSV — no third-party library."""
-        d1 = start.replace("-", "")
-        d2 = end.replace("-", "")
-        # URL-encode special chars in ticker (^ → %5E, . → %2E)
-        t_enc = ticker.replace("^", "%5E").replace(".", "%2E")
-        url = f"https://stooq.com/q/d/l/?s={t_enc}&d1={d1}&d2={d2}&i=w"
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0 Safari/537.36"
-            )
-        }
-        resp = requests.get(url, headers=headers, timeout=30)
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+_STOOQ_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    )
+}
+
+def _fetch_one(ticker: str, start: str, end: str):
+    """Fetch one ticker weekly Close from Stooq CSV."""
+    d1 = start.replace("-", "")
+    d2 = end.replace("-", "")
+    t_enc = ticker.replace("^", "%5E").replace(".", "%2E")
+    url = f"https://stooq.com/q/d/l/?s={t_enc}&d1={d1}&d2={d2}&i=w"
+    try:
+        resp = requests.get(url, headers=_STOOQ_HEADERS, timeout=20)
         resp.raise_for_status()
         text = resp.text.strip()
         if not text or "No data" in text or len(text) < 30:
-            return None
+            return ticker, None, "no data"
         df = pd.read_csv(io.StringIO(text))
-        # Stooq CSV columns: Date,Open,High,Low,Close,Volume
         if "Date" not in df.columns or "Close" not in df.columns:
-            return None
+            return ticker, None, "bad columns"
         df["Date"] = pd.to_datetime(df["Date"])
-        df = df.set_index("Date").sort_index()
-        return df["Close"]
+        series = df.set_index("Date")["Close"].sort_index()
+        if series.notna().sum() < 50:
+            return ticker, None, "too few rows"
+        return ticker, series, None
+    except Exception as exc:
+        return ticker, None, str(exc)
 
+
+def download_data_parallel(tickers: tuple, start: str, end: str,
+                            status_ph=None, progress_ph=None):
+    """Download all tickers in parallel (8 workers) with live progress."""
+    n = len(tickers)
     frames = {}
     failed = []
-    for ticker in tickers:
-        try:
-            series = _stooq_csv(ticker, start, end)
-            if series is None or series.notna().sum() < 50:
+    done = 0
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(_fetch_one, t, start, end): t for t in tickers}
+        for fut in as_completed(futures):
+            ticker, series, err = fut.result()
+            done += 1
+            if series is not None:
+                frames[ticker] = series
+                msg = f"✅ {ticker}"
+            else:
                 failed.append(ticker)
-                continue
-            frames[ticker] = series
-        except Exception:
-            failed.append(ticker)
+                msg = f"⚠️ {ticker} — {err}"
+            if status_ph:
+                status_ph.text(f"Fetching prices… {done}/{n}   {msg}")
+            if progress_ph:
+                progress_ph.progress(done / n)
 
     if not frames:
-        raise ValueError("No data fetched. Check internet connectivity.")
+        raise ValueError(
+            "No data fetched from Stooq. "
+            "Stooq may be temporarily rate-limiting — wait 30 s and try again."
+        )
 
     prices = pd.DataFrame(frames).sort_index()
     prices.index = pd.to_datetime(prices.index)
@@ -226,9 +245,15 @@ def download_data(tickers: tuple, start: str, end: str) -> pd.DataFrame:
     prices = prices.ffill().dropna(how="all")
 
     if prices.empty:
-        raise ValueError("All tickers had >30% missing data.")
+        raise ValueError("All tickers had >30% missing data after download.")
 
     return prices, dropped, failed
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def download_data(tickers: tuple, start: str, end: str):
+    """Cached wrapper — avoids re-fetching on page interactions."""
+    return download_data_parallel(tickers, start, end)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -889,14 +914,27 @@ active_universe = {t: ASSET_UNIVERSE[t] for t in selected_tickers if t in ASSET_
 # STEP 1 — DATA
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown('<div class="section-header">Step 1 — Downloading Data</div>', unsafe_allow_html=True)
-with st.spinner("Fetching prices from Stooq…"):
-    try:
-        prices_raw, dropped_tickers, failed_tickers = download_data(
-            tuple(selected_tickers), start_date, end_date
-        )
-    except Exception as e:
-        st.error(f"Data download failed: {e}")
-        st.stop()
+
+_status_ph   = st.empty()
+_progress_ph = st.progress(0)
+_status_ph.text(f"Fetching {len(selected_tickers)} tickers from Stooq in parallel…")
+
+try:
+    prices_raw, dropped_tickers, failed_tickers = download_data_parallel(
+        tuple(selected_tickers), start_date, end_date,
+        status_ph=_status_ph, progress_ph=_progress_ph
+    )
+except Exception as e:
+    _status_ph.empty()
+    _progress_ph.empty()
+    st.error(f"Data download failed: {e}")
+    st.stop()
+
+_progress_ph.progress(1.0)
+_status_ph.success(
+    f"✅ Downloaded {prices_raw.shape[1]} assets × {prices_raw.shape[0]} weeks  "
+    f"({prices_raw.index[0].date()} → {prices_raw.index[-1].date()})"
+)
 
 # Keep active_universe in sync with what actually downloaded
 active_universe = {t: active_universe[t] for t in prices_raw.columns if t in active_universe}
