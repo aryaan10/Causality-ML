@@ -1,7 +1,7 @@
 """
 Causal Out-Strength Centrality Factor Model
 Inspired by Stavroglou et al. (2019) — "Causality Networks of Financial Assets"
-Data: Stooq via pandas_datareader (free, no API key, works on Streamlit Cloud)
+Data: Stooq CSV (direct requests, no pandas_datareader, works on Python 3.14+)
 """
 
 import warnings
@@ -10,7 +10,8 @@ warnings.filterwarnings("ignore")
 import streamlit as st
 import numpy as np
 import pandas as pd
-import pandas_datareader.data as web
+import requests
+import io
 import networkx as nx
 import matplotlib
 matplotlib.use("Agg")
@@ -22,7 +23,6 @@ import seaborn as sns
 from statsmodels.tsa.stattools import grangercausalitytests, adfuller
 from scipy import stats
 from scipy.stats import spearmanr
-import io
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -173,19 +173,42 @@ plt.rcParams.update({
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=3600)
 def download_data(tickers: tuple, start: str, end: str) -> pd.DataFrame:
+    def _stooq_csv(ticker: str, start: str, end: str):
+        """Fetch weekly Close prices from Stooq as a plain CSV — no third-party library."""
+        d1 = start.replace("-", "")
+        d2 = end.replace("-", "")
+        # URL-encode special chars in ticker (^ → %5E, . → %2E)
+        t_enc = ticker.replace("^", "%5E").replace(".", "%2E")
+        url = f"https://stooq.com/q/d/l/?s={t_enc}&d1={d1}&d2={d2}&i=w"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            )
+        }
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        text = resp.text.strip()
+        if not text or "No data" in text or len(text) < 30:
+            return None
+        df = pd.read_csv(io.StringIO(text))
+        # Stooq CSV columns: Date,Open,High,Low,Close,Volume
+        if "Date" not in df.columns or "Close" not in df.columns:
+            return None
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date").sort_index()
+        return df["Close"]
+
     frames = {}
     failed = []
     for ticker in tickers:
         try:
-            df = web.DataReader(ticker, "stooq", start=start, end=end)
-            if df.empty or "Close" not in df.columns:
+            series = _stooq_csv(ticker, start, end)
+            if series is None or series.notna().sum() < 50:
                 failed.append(ticker)
                 continue
-            series = df["Close"].sort_index()
-            if series.notna().sum() > 50:
-                frames[ticker] = series
-            else:
-                failed.append(ticker)
+            frames[ticker] = series
         except Exception:
             failed.append(ticker)
 
