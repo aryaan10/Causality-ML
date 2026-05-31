@@ -7,6 +7,7 @@ Data: Yahoo Finance via yfinance Ticker.history() — parallel, works on Streaml
 import warnings
 warnings.filterwarnings("ignore")
 
+import io
 import streamlit as st
 import numpy as np
 import pandas as pd
